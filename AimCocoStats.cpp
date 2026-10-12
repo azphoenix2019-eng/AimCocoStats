@@ -11,14 +11,18 @@
 #include <sstream>
 #include <vector>
 
-BAKKESMOD_PLUGIN(AimCocoStats, "Aim Coco Stats", "1.0", PLUGINTYPE_FREEPLAY)
+BAKKESMOD_PLUGIN(AimCocoStats, "Aim Coco Stats", "1.1", PLUGINTYPE_FREEPLAY)
 
 namespace {
     constexpr float UU_EN_KMH = 0.036f;      // 1 uu/s = 0,036 km/h
     constexpr float UU_EN_M = 0.01f;         // 1 uu = 1 cm
     constexpr float SAUT_RESPAWN = 400.f;    // déplacement instantané = balle replacée
     constexpr int TICKS_MESURE_TIR = 15;     // ~0,12 s après la touche pour la vitesse du tir
+    constexpr int TICKS_ATTENTE = 60;        // ~0,5 s après la fin d'une balle avant de l'écrire
     constexpr float BUT_Y = 5120.f, BUT_X = 893.f, BUT_Z = 642.f, RAYON_BALLE = 93.f;
+
+    // Variables de la map qui augmentent quand une cible est touchée
+    const char* VARS_SCORE[] = {"Streak", "Count"};
 
     std::string minuscules(std::string s) {
         std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::tolower(c); });
@@ -63,14 +67,15 @@ namespace {
 void AimCocoStats::onLoad()
 {
     cvarManager->registerCvar("aimcoco_actif", "1", "Active l'enregistrement des tirs", true, true, 0, true, 1);
-    cvarManager->registerCvar("aimcoco_map", "aim", "Morceau du nom de la map à suivre (minuscules)");
-    cvarManager->registerCvar("aimcoco_mode", "Facile", "Mode / difficulté en cours");
-    cvarManager->registerCvar("aimcoco_modes", "Facile,Moyen,Difficile", "Liste des modes (séparés par des virgules)");
+    cvarManager->registerCvar("aimcoco_map", "aimtraining", "Morceau du nom de la map à suivre (minuscules)");
+    cvarManager->registerCvar("aimcoco_mode_auto", "1", "Lit le mode directement dans la map", true, true, 0, true, 1);
+    cvarManager->registerCvar("aimcoco_mode", "Classique", "Mode utilisé si la détection automatique est coupée");
+    cvarManager->registerCvar("aimcoco_modes", "Classique,Survie", "Liste des modes pour aimcoco_mode_suivant");
     cvarManager->registerCvar("aimcoco_hud", "1", "Affiche les stats en jeu", true, true, 0, true, 1);
     cvarManager->registerCvar("aimcoco_debug", "0", "Messages de debug dans la console F6", true, true, 0, true, 1);
 
     cvarManager->registerNotifier("aimcoco_mode_suivant", [this](std::vector<std::string>) { modeSuivant(); },
-                                  "Passe au mode suivant", PERMISSION_ALL);
+                                  "Passe au mode suivant (si la détection automatique est coupée)", PERMISSION_ALL);
     cvarManager->registerNotifier("aimcoco_definir_map", [this](std::vector<std::string>) {
         std::string map = minuscules(gameWrapper->GetCurrentMap());
         cvarManager->getCvar("aimcoco_map").setValue(map);
@@ -85,11 +90,13 @@ void AimCocoStats::onLoad()
     // tick physique (~120 fois par seconde)
     gameWrapper->HookEvent("Function TAGame.Car_TA.SetVehicleInput", [this](std::string) { onTick(); });
     gameWrapper->HookEvent("Function TAGame.Ball_TA.OnCarTouch", [this](std::string) { onTouche(); });
-    gameWrapper->HookEvent("Function TAGame.Ball_TA.OnHitGoal", [this](std::string) { onBut(); });
-    // sortie de la map : on clôt le tir en cours
+    gameWrapper->HookEvent("Function TAGame.Ball_TA.OnHitGoal", [this](std::string) { onButClassique(); });
+    // sortie de la map : on clôt tout
     gameWrapper->HookEvent("Function TAGame.GameEvent_Soccar_TA.Destroyed", [this](std::string) {
         if (tir.actif) terminerTir();
+        if (enAttente.actif) { ecrireTir(enAttente); enAttente.actif = false; }
         derniereBalle = 0;
+        viderKismet();
     });
 
     gameWrapper->RegisterDrawable([this](CanvasWrapper c) { dessiner(c); });
@@ -100,6 +107,79 @@ void AimCocoStats::onLoad()
 void AimCocoStats::onUnload()
 {
     if (tir.actif) terminerTir();
+    if (enAttente.actif) { ecrireTir(enAttente); enAttente.actif = false; }
+    viderKismet();
+}
+
+// ------------------------------------------------------------------ Kismet (variables internes de la map)
+
+void AimCocoStats::chargerKismet()
+{
+    kismetCharge = true;
+    kismet.clear();
+    scoreParKismet = false;
+    SequenceWrapper sequence = gameWrapper->GetMainSequence();
+    if (sequence.memory_address == 0) return;
+    for (auto& [nom, var] : sequence.GetAllSequenceVariables(true)) {
+        if (var.memory_address == 0) continue;
+        if (var.IsInt()) kismet.push_back({nom, var, true, var.GetInt()});
+        else if (var.IsBool()) kismet.push_back({nom, var, false, var.GetBool() ? 1 : 0});
+        else continue;
+        for (const char* s : VARS_SCORE)
+            if (nom == s) scoreParKismet = true;
+    }
+    if (cvarManager->getCvar("aimcoco_debug").getBoolValue())
+        cvarManager->log("[AimCoco] " + std::to_string(kismet.size()) + " variables surveillées, score par la map : " +
+                         (scoreParKismet ? "oui" : "non"));
+}
+
+void AimCocoStats::viderKismet()
+{
+    kismet.clear();
+    kismetCharge = false;
+    scoreParKismet = false;
+}
+
+void AimCocoStats::surveillerKismet()
+{
+    bool debug = cvarManager->getCvar("aimcoco_debug").getBoolValue();
+    for (VarKismet& k : kismet) {
+        int v = k.estEntier ? k.var.GetInt() : (k.var.GetBool() ? 1 : 0);
+        if (v == k.valeur) continue;
+        if (debug)
+            cvarManager->log("[AimCoco] " + k.nom + " : " + std::to_string(k.valeur) + " -> " + std::to_string(v));
+        for (const char* s : VARS_SCORE)
+            if (k.nom == s && v > k.valeur) marquerBut();
+        k.valeur = v;
+    }
+}
+
+int AimCocoStats::valeurKismet(const std::string& nom, int defaut)
+{
+    for (const VarKismet& k : kismet)
+        if (k.nom == nom) return k.valeur;
+    return defaut;
+}
+
+std::string AimCocoStats::modeActuel()
+{
+    if (!cvarManager->getCvar("aimcoco_mode_auto").getBoolValue() || kismet.empty())
+        return cvarManager->getCvar("aimcoco_mode").getStringValue();
+    std::string mode;
+    if (valeurKismet("SurvivalMode")) mode = "Survie";
+    else if (valeurKismet("ClassicMode")) mode = "Classique";
+    else mode = "Autre";
+    if (valeurKismet("EasyMode")) mode += " facile";
+    return mode;
+}
+
+std::string AimCocoStats::optionsActuelles()
+{
+    auto b = [this](const char* nom) { return valeurKismet(nom) ? "true" : "false"; };
+    return std::string(",\"cibles_mobiles\":") + b("MovingTargets") +
+           ",\"cibles_aleatoires\":" + b("RandomTargets") +
+           ",\"distances_aleatoires\":" + b("RandomDistances") +
+           ",\"chutes_aleatoires\":" + b("RandomDrops");
 }
 
 // ------------------------------------------------------------------ détection
@@ -109,10 +189,11 @@ bool AimCocoStats::surMapSuivie()
     if (!cvarManager->getCvar("aimcoco_actif").getBoolValue()) return false;
     std::string cible = minuscules(cvarManager->getCvar("aimcoco_map").getStringValue());
     std::string map = minuscules(gameWrapper->GetCurrentMap());
-    if (map != derniereMap) {          // nouvelle map : nouvelle session d'affichage
+    if (map != derniereMap) {          // nouvelle map : nouvelle session, nouvelles variables
         derniereMap = map;
         sessionTirs = sessionButs = 0;
         dernierTirTexte.clear();
+        viderKismet();
     }
     return !cible.empty() && map.find(cible) != std::string::npos;
 }
@@ -121,13 +202,23 @@ void AimCocoStats::onTick()
 {
     if (!surMapSuivie()) {
         if (tir.actif) terminerTir();
+        if (enAttente.actif) { ecrireTir(enAttente); enAttente.actif = false; }
         hudVisible = false;
         return;
     }
+    if (!kismetCharge) chargerKismet();
+    surveillerKismet();
+
+    // le tir précédent est écrit une fois le délai passé
+    if (enAttente.actif && ++ticksAttente >= TICKS_ATTENTE) {
+        ecrireTir(enAttente);
+        enAttente.actif = false;
+    }
+
     ServerWrapper server = gameWrapper->GetGameEventAsServer();
     if (server.IsNull()) return;
     BallWrapper balle = server.GetBall();
-    if (balle.IsNull()) {               // balle détruite (but, reset…)
+    if (balle.IsNull()) {               // balle détruite (reset…)
         if (tir.actif) terminerTir();
         derniereBalle = 0;
         return;
@@ -157,9 +248,10 @@ void AimCocoStats::onTick()
         tir.vitesseTir = std::max(tir.vitesseTir, vitesse);
     }
 
-    // sécurité si l'évènement de but n'est pas déclenché par la map
-    if (!tir.but && std::fabs(pos.X) < BUT_X && std::fabs(pos.Y) > BUT_Y + RAYON_BALLE && pos.Z < BUT_Z)
-        onBut();
+    // maps sans score interne : on se rabat sur les buts classiques
+    if (!scoreParKismet && !tir.but && std::fabs(pos.X) < BUT_X &&
+        std::fabs(pos.Y) > BUT_Y + RAYON_BALLE && pos.Z < BUT_Z)
+        marquerBut();
 
     majHud();
 }
@@ -188,12 +280,19 @@ void AimCocoStats::onTouche()
     }
 }
 
-void AimCocoStats::onBut()
+void AimCocoStats::onButClassique()
 {
-    if (!tir.actif || tir.but) return;
-    tir.but = true;
+    if (!scoreParKismet) marquerBut();
+}
+
+void AimCocoStats::marquerBut()
+{
+    // si la map a déjà replacé la balle, le point revient au tir qui vient de se terminer
+    Tir* cible = enAttente.actif ? &enAttente : (tir.actif ? &tir : nullptr);
+    if (cible == nullptr || cible->but) return;
+    cible->but = true;
     if (cvarManager->getCvar("aimcoco_debug").getBoolValue())
-        cvarManager->log("[AimCoco] But !");
+        cvarManager->log("[AimCoco] Cible touchée !");
 }
 
 // ------------------------------------------------------------------ tirs
@@ -203,28 +302,38 @@ void AimCocoStats::demarrerTir(const Vector& pos, const Vector& vel)
     tir = Tir{};
     tir.actif = true;
     tir.date = maintenant();
+    tir.mode = modeActuel();
+    tir.options = kismet.empty() ? "" : optionsActuelles();
     tir.debut = std::chrono::steady_clock::now();
     tir.balleDepart = pos;
     tir.vitesseDepart = vel.magnitude();
     if (cvarManager->getCvar("aimcoco_debug").getBoolValue())
-        cvarManager->log("[AimCoco] Nouvelle balle, hauteur " + nb(pos.Z * UU_EN_M) + " m");
+        cvarManager->log("[AimCoco] Nouvelle balle (" + tir.mode + "), hauteur " + nb(pos.Z * UU_EN_M) + " m");
 }
 
 void AimCocoStats::terminerTir()
 {
-    Tir t = tir;
     tir.actif = false;
-    float duree = std::chrono::duration<float>(std::chrono::steady_clock::now() - t.debut).count();
-    if (!t.touche && duree < 0.5f) return;   // reset immédiat : on ignore
+    tir.duree = std::chrono::duration<float>(std::chrono::steady_clock::now() - tir.debut).count();
+    if (!tir.touche && !tir.but && tir.duree < 0.5f) return;   // reset immédiat : on ignore
 
+    if (enAttente.actif) ecrireTir(enAttente);
+    enAttente = tir;
+    enAttente.actif = true;
+    ticksAttente = 0;
+}
+
+void AimCocoStats::ecrireTir(const Tir& t)
+{
     // but visé : celui de l'équipe adverse (bleu -> but orange en +Y)
     Vector cible{0.f, t.equipe == 0 ? BUT_Y : -BUT_Y, 321.f};
 
     std::ostringstream o;
     o << "{\"date\":" << json(t.date)
       << ",\"map\":" << json(gameWrapper->GetCurrentMap())
-      << ",\"mode\":" << json(cvarManager->getCvar("aimcoco_mode").getStringValue())
-      << ",\"duree\":" << nb(duree)
+      << ",\"mode\":" << json(t.mode)
+      << t.options
+      << ",\"duree\":" << nb(t.duree)
       << ",\"touche\":" << (t.touche ? "true" : "false")
       << ",\"but\":" << (t.but ? "true" : "false")
       << ",\"nb_touches\":" << t.nbTouches
@@ -245,7 +354,7 @@ void AimCocoStats::terminerTir()
     if (t.touche) {
         sessionTirs++;
         if (t.but) sessionButs++;
-        dernierTirTexte = std::string(t.but ? "But" : "Manque") + " - " + nb(t.vitesseTir * UU_EN_KMH, 0) +
+        dernierTirTexte = std::string(t.but ? "Cible" : "Manque") + " - " + nb(t.vitesseTir * UU_EN_KMH, 0) +
                           " km/h, " + nb(distance(t.balleTouche, cible) * UU_EN_M, 0) + " m";
     }
     if (cvarManager->getCvar("aimcoco_debug").getBoolValue())
@@ -284,8 +393,8 @@ void AimCocoStats::majHud()
 {
     std::lock_guard<std::mutex> verrou(hudMutex);
     hudVisible = cvarManager->getCvar("aimcoco_hud").getBoolValue();
-    hudLignes[0] = "Aim Coco - mode : " + cvarManager->getCvar("aimcoco_mode").getStringValue();
-    hudLignes[1] = "Session : " + std::to_string(sessionButs) + " / " + std::to_string(sessionTirs) + " buts" +
+    hudLignes[0] = "Aim Coco - " + tir.mode;
+    hudLignes[1] = "Session : " + std::to_string(sessionButs) + " / " + std::to_string(sessionTirs) + " cibles" +
                    (sessionTirs ? " (" + nb(100.f * sessionButs / sessionTirs, 0) + " %)" : "");
     hudLignes[2] = dernierTirTexte.empty() ? "" : "Dernier tir : " + dernierTirTexte;
 }
